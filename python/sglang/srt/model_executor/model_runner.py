@@ -228,14 +228,11 @@ class ModelRunner:
 
     def init_torch_distributed(self):
         logger.info("Init torch distributed begin.")
-
         torch.get_device_module(self.device).set_device(self.gpu_id)
         if self.device == "cuda":
             backend = "nccl"
         elif self.device == "xpu":
-            # TODO(liangan1): Just use gloo to bypass the initilization fail
-            # Need to use xccl for xpu backend in the future
-            backend = "gloo"
+            backend = "xccl"
         elif self.device == "hpu":
             backend = "hccl"
         elif self.device == "cpu":
@@ -287,7 +284,6 @@ class ModelRunner:
         logger.info(
             f"Load weight begin. avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
         )
-
         # This can reduce thread conflicts and speed up weight loading.
         if self.device != "cpu":
             torch.set_num_threads(1)

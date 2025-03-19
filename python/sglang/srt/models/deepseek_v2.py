@@ -599,12 +599,18 @@ class DeepseekV2AttentionMLA(nn.Module):
                 self.w_kc.to(torch.bfloat16) * self.w_scale,
             )
         elif self.w_kc.dtype == torch.float8_e4m3fn:
+            q_nope_out = torch.bmm(
+                q_nope.to(torch.bfloat16).transpose(0, 1),
+                self.w_kc.to(torch.bfloat16) * self.w_scale,
+            )
+            '''
             q_nope_val, q_nope_scale = input_to_float8(
                 q_nope.transpose(0, 1), torch.float8_e4m3fn
             )
             q_nope_out = bmm_fp8(
                 q_nope_val, self.w_kc, q_nope_scale, self.w_scale, torch.bfloat16
             )
+            '''
         else:
             q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
         q_input[..., : self.kv_lora_rank] = q_nope_out.transpose(0, 1)
@@ -630,6 +636,11 @@ class DeepseekV2AttentionMLA(nn.Module):
                 self.w_vc.to(torch.bfloat16) * self.w_scale,
             )
         elif self.w_vc.dtype == torch.float8_e4m3fn:
+            attn_bmm_output = torch.bmm(
+                attn_output.to(torch.bfloat16).transpose(0, 1),
+                self.w_vc.to(torch.bfloat16) * self.w_scale,
+            )
+            '''
             attn_output_val, attn_output_scale = input_to_float8(
                 attn_output.transpose(0, 1), torch.float8_e4m3fn
             )
@@ -640,6 +651,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                 self.w_scale,
                 torch.bfloat16,
             )
+            '''
         else:
             attn_bmm_output = torch.bmm(attn_output.transpose(0, 1), self.w_vc)
         attn_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
@@ -810,6 +822,7 @@ class DeepseekV2Model(nn.Module):
             config.hidden_size,
             enable_tp=not global_server_args_dict["enable_dp_attention"],
         )
+        config.num_hidden_layers = 6
         self.layers = nn.ModuleList(
             [
                 DeepseekV2DecoderLayer(
@@ -851,6 +864,7 @@ class DeepseekV2ForCausalLM(nn.Module):
         self.config = config
         self.quant_config = quant_config
         self.model = DeepseekV2Model(config, quant_config)
+        print(self.model)
         if global_server_args_dict["enable_dp_attention"]:
             self.lm_head = ReplicatedLinear(
                 config.hidden_size,

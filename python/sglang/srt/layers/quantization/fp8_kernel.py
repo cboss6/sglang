@@ -124,6 +124,33 @@ def _per_token_group_quant_fp8_colmajor(
     tl.store(y_s_ptr, y_s)
 
 
+def native_per_token_group_quant_fp8(
+    x, group_size, eps=1e-10, dtype=torch.float8_e4m3fn
+):
+    """Function to perform per-token-group quantization on an input tensor `x` using native torch.
+
+    It converts the tensor values into float8 values and returns the
+    quantized tensor along with the scaling factor used for quantization.
+    Note that only `torch.float8_e4m3fn` is supported for now.
+    """
+    assert (
+        x.shape[-1] % group_size == 0
+    ), "the last dimension of `x` cannot be divisible by `group_size`"
+    assert x.is_contiguous(), "`x` is not contiguous"
+
+    finfo = torch.finfo(dtype)
+    fp8_min = finfo.min
+    fp8_max = finfo.max
+
+    x_ = x.reshape(x.numel() // group_size, group_size)
+    amax = x_.abs().max(dim=-1, keepdim=True)[0].clamp(min=eps).to(torch.float32)
+    x_s = amax / fp8_max
+    x_q = (x_ / x_s).clamp(min=fp8_min, max=fp8_max).to(dtype)
+    x_q = x_q.reshape(x.shape)
+    x_s = x_s.reshape(x.shape[:-1] + (x.shape[-1] // group_size,))
+
+    return x_q, x_s
+
 def per_token_group_quant_fp8(
     x: torch.Tensor,
     group_size: int,
@@ -194,6 +221,7 @@ def per_token_group_quant_fp8(
             num_stages=num_stages,
         )
     else:
+        '''
         _per_token_group_quant_fp8[(M,)](
             x,
             x_q,
@@ -207,6 +235,8 @@ def per_token_group_quant_fp8(
             num_warps=num_warps,
             num_stages=num_stages,
         )
+        '''
+        x_q, x_s = native_per_token_group_quant_fp8(x, group_size)
 
     return x_q, x_s
 

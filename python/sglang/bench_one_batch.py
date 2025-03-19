@@ -428,19 +428,19 @@ def latency_test(
     )
 
     # Warm up
-    rank_print("Warmup ...")
-    latency_test_run_once(
-        bench_args.run_name,
-        model_runner,
-        rank_print,
-        reqs,
-        bench_args.batch_size[0],
-        bench_args.input_len[0],
-        8,  # shorter decoding to speed up the warmup
-        server_args.device,
-        profile=False,
-        profile_filename_prefix="",  # not used
-    )
+    # rank_print("Warmup ...")
+    # latency_test_run_once(
+    #     bench_args.run_name,
+    #     model_runner,
+    #     rank_print,
+    #     reqs,
+    #     bench_args.batch_size[0],
+    #     bench_args.input_len[0],
+    #     8,  # shorter decoding to speed up the warmup
+    #     server_args.device,
+    #     profile=False,
+    #     profile_filename_prefix="",  # not used
+    # )
 
     rank_print("Benchmark ...")
 

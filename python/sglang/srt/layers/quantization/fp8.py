@@ -47,6 +47,8 @@ from sglang.srt.utils import (
     set_weight_attrs,
 )
 
+from sglang.srt.layers.activation import SiluAndMul
+
 ACTIVATION_SCHEMES = ["static", "dynamic"]
 
 is_hip_ = is_hip()
@@ -758,6 +760,118 @@ class Fp8MoEMethod:
                     torch.cuda.empty_cache()
             return
 
+    def torch_w8a8_block_fp8_moe(self, a, w1, w2, w1_s, w2_s, score, topk, block_shape):
+        def native_per_token_group_quant_fp8(
+            x, group_size, eps=1e-10, dtype=torch.float8_e4m3fn
+        ):
+            """Function to perform per-token-group quantization on an input tensor `x` using native torch.
+
+            It converts the tensor values into float8 values and returns the
+            quantized tensor along with the scaling factor used for quantization.
+            Note that only `torch.float8_e4m3fn` is supported for now.
+            """
+            assert (
+                x.shape[-1] % group_size == 0
+            ), "the last dimension of `x` cannot be divisible by `group_size`"
+            assert x.is_contiguous(), "`x` is not contiguous"
+
+            finfo = torch.finfo(dtype)
+            fp8_min = finfo.min
+            fp8_max = finfo.max
+
+            x_ = x.reshape(x.numel() // group_size, group_size)
+            amax = x_.abs().max(dim=-1, keepdim=True)[0].clamp(min=eps).to(torch.float32)
+            x_s = amax / fp8_max
+            x_q = (x_ / x_s).clamp(min=fp8_min, max=fp8_max).to(dtype)
+            x_q = x_q.reshape(x.shape)
+            x_s = x_s.reshape(x.shape[:-1] + (x.shape[-1] // group_size,))
+
+            return x_q, x_s
+        
+        def native_w8a8_block_fp8_matmul(A, B, As, Bs, block_size, output_dtype=torch.float16):
+            """This function performs matrix multiplication with block-wise quantization using native torch.
+
+            It takes two input tensors `A` and `B` with scales `As` and `Bs`.
+            The output is returned in the specified `output_dtype`.
+            """
+
+            A = A.to(torch.float32)
+            B = B.to(torch.float32)
+            assert A.shape[-1] == B.shape[-1]
+            assert B.ndim == 2 and B.is_contiguous() and Bs.ndim == 2
+            assert len(block_size) == 2
+            block_n, block_k = block_size[0], block_size[1]
+            assert (A.shape[-1] + block_k - 1) // block_k == As.shape[-1]
+            assert A.shape[:-1] == As.shape[:-1]
+
+            M = A.numel() // A.shape[-1]
+            N, K = B.shape
+            origin_C_shape = A.shape[:-1] + (N,)
+            A = A.reshape(M, A.shape[-1])
+            As = As.reshape(M, As.shape[-1])
+            n_tiles = (N + block_n - 1) // block_n
+            k_tiles = (K + block_k - 1) // block_k
+            assert n_tiles == Bs.shape[0]
+            assert k_tiles == Bs.shape[1]
+
+            C_shape = (M, N)
+            C = torch.zeros(C_shape, dtype=torch.float32, device=A.device)
+
+            A_tiles = [A[:, i * block_k : min((i + 1) * block_k, K)] for i in range(k_tiles)]
+            B_tiles = [
+                [
+                    B[
+                        j * block_n : min((j + 1) * block_n, N),
+                        i * block_k : min((i + 1) * block_k, K),
+                    ]
+                    for i in range(k_tiles)
+                ]
+                for j in range(n_tiles)
+            ]
+            C_tiles = [C[:, j * block_n : min((j + 1) * block_n, N)] for j in range(n_tiles)]
+            As_tiles = [As[:, i : i + 1] for i in range(k_tiles)]
+
+            for i in range(k_tiles):
+                for j in range(n_tiles):
+                    a = A_tiles[i]
+                    b = B_tiles[j][i]
+                    c = C_tiles[j]
+                    s = As_tiles[i] * Bs[j][i]
+                    c[:, :] += torch.matmul(a, b.t()) * s
+
+            C = C.reshape(origin_C_shape).to(output_dtype)
+            return C
+
+        """This function performs fused moe with block-wise quantization using native torch."""
+
+        B, D = a.shape
+        a = a.view(B, -1, D).repeat(1, topk, 1).reshape(-1, D)
+        out = torch.zeros(B * topk, w2.shape[1], dtype=a.dtype, device=a.device)
+        score = torch.softmax(score, dim=-1, dtype=torch.float32)
+        topk_weight, topk_ids = torch.topk(score, topk)
+        topk_weight = topk_weight.view(-1)
+        topk_ids = topk_ids.view(-1)
+
+        _, block_k = block_shape[0], block_shape[1]
+        a_q, a_s = native_per_token_group_quant_fp8(a, block_k)
+        # NOTE(HandH1998): Since "index_cuda" not implemented for 'Float8_e4m3fn', we need to cast `float8`` to `float32``.
+        a_q = a_q.to(torch.float32)
+        for i in range(w1.shape[0]):
+            mask = topk_ids == i
+            if mask.sum():
+                inter_out = native_w8a8_block_fp8_matmul(
+                    a_q[mask], w1[i], a_s[mask], w1_s[i], block_shape, output_dtype=a.dtype
+                )
+                act_out = SiluAndMul().forward_native(inter_out)
+                act_out_q, act_out_s = native_per_token_group_quant_fp8(act_out, block_k)
+                act_out = act_out.to(torch.float32)
+                out[mask] = native_w8a8_block_fp8_matmul(
+                    act_out_q, w2[i], act_out_s, w2_s[i], block_shape, output_dtype=a.dtype
+                )
+        return (
+            out.view(B, -1, w2.shape[1]) * topk_weight.view(B, -1, 1).to(out.dtype)
+        ).sum(dim=1)
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -775,6 +889,7 @@ class Fp8MoEMethod:
         from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
         from sglang.srt.layers.moe.topk import select_experts
 
+        '''
         # Expert selection
         topk_weights, topk_ids = select_experts(
             hidden_states=x,
@@ -840,6 +955,27 @@ class Fp8MoEMethod:
                 a2_scale=layer.w2_input_scale,
                 block_shape=self.quant_config.weight_block_size,
             )
+        '''
+        
+        return self.torch_w8a8_block_fp8_moe(
+                a=x, 
+                w1=layer.w13_weight, 
+                w2=layer.w2_weight, 
+                w1_s=(
+                    layer.w13_weight_scale_inv
+                    if self.block_quant
+                    else layer.w13_weight_scale
+                ), 
+                w2_s=(
+                    layer.w2_weight_scale_inv
+                    if self.block_quant
+                    else layer.w2_weight_scale
+                ), 
+                score=router_logits, 
+                topk=top_k, 
+                block_shape=self.quant_config.weight_block_size
+            )
+
 
 
 class Fp8KVCacheMethod(BaseKVCacheMethod):
