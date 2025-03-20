@@ -822,7 +822,6 @@ class DeepseekV2Model(nn.Module):
             config.hidden_size,
             enable_tp=not global_server_args_dict["enable_dp_attention"],
         )
-        config.num_hidden_layers = 6
         self.layers = nn.ModuleList(
             [
                 DeepseekV2DecoderLayer(
